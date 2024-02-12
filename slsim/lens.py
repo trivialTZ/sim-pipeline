@@ -5,6 +5,7 @@ from lenstronomy.LensModel.lens_model import LensModel
 from lenstronomy.LightModel.light_model import LightModel
 from lenstronomy.LensModel.Solver.lens_equation_solver import LensEquationSolver
 from slsim.ParamDistributions.gaussian_mixture_model import GaussianMixtureModel
+from slsim.ParamDistributions.kext_gext_distributions import LineOfSightDistribution
 from lenstronomy.Util import util, data_util
 from slsim.lensed_system_base import LensedSystemBase
 import warnings
@@ -20,11 +21,13 @@ class Lens(LensedSystemBase):
         cosmo,
         source_type="extended",
         variability_model=None,
-        kwargs_variability=None,
+        kwargs_variab=None,
         test_area=4 * np.pi,
         mixgauss_means=None,
         mixgauss_stds=None,
         mixgauss_weights=None,
+        los_bool = True,
+        nonlinear_los_bool=True,
         magnification_limit=0.01,
     ):
         """
@@ -40,7 +43,7 @@ class Lens(LensedSystemBase):
         :param variability_model: keyword for variability model to be used. This is an
          input for the Variability class.
         :type variability_model: str
-        :param kwargs_variability: keyword arguments for the variability of a source.
+        :param kwargs_variab: keyword arguments for the variability of a source.
          This is associated with an input for Variability class.
         :type kwargs_variab: list of str
         :param test_area: area of disk around one lensing galaxies to be investigated
@@ -61,16 +64,18 @@ class Lens(LensedSystemBase):
             cosmo=cosmo,
             test_area=test_area,
             variability_model=variability_model,
-            kwargs_variability=kwargs_variability,
+            kwargs_variability=kwargs_variab,
         )
 
+        self.los_bool = los_bool
         self.cosmo = cosmo
         self._source_type = source_type
         self._mixgauss_means = mixgauss_means
         self._mixgauss_stds = mixgauss_stds
         self._mixgauss_weights = mixgauss_weights
         self._magnification_limit = magnification_limit
-        self.kwargs_variab = kwargs_variability
+        self.kwargs_variab = kwargs_variab
+        self.nonlinear_los_bool = nonlinear_los_bool
 
         if self._source_type == "extended" and self.kwargs_variab is not None:
             warning_msg = (
@@ -89,6 +94,15 @@ class Lens(LensedSystemBase):
             self._theta_E_sis = lens_cosmo.sis_sigma_v2theta_E(
                 float(self._deflector_dict["vel_disp"])
             )
+
+    @property
+    def image_number(self):
+        """Number of images in the lensing configuration.
+
+        :return: number of images
+        """
+        return len(self.image_positions()[0])
+
 
     @property
     def deflector_position(self):
@@ -238,6 +252,22 @@ class Lens(LensedSystemBase):
         """
         return self.source.redshift
 
+    def external_convergence(self):
+        """
+
+        :return: external convergence
+        """
+        _, _, kappa_ext = self.los_linear_distortions()
+        return kappa_ext
+
+    def external_shear(self):
+        """
+
+        :return: external shear
+        """
+        gamma1, gamma2, _ = self.los_linear_distortions()
+        return (gamma1**2+gamma2**2)**0.5
+
     @property
     def einstein_radius(self):
         """Einstein radius, including the SIS + external convergence effect.
@@ -281,23 +311,26 @@ class Lens(LensedSystemBase):
         """
         # TODO: more realistic distribution of shear and convergence,
         #  the covariances among them and redshift correlations
-        mixgauss_means = self._mixgauss_means
-        mixgauss_stds = self._mixgauss_stds
-        mixgauss_weights = self._mixgauss_weights
-        if not hasattr(self, "_gamma"):
-            mixture = GaussianMixtureModel(
-                means=mixgauss_means,
-                stds=mixgauss_stds,
-                weights=mixgauss_weights,
-            )
-            gamma = np.abs(mixture.rvs(size=1))[0]
-            phi = 2 * np.pi * np.random.random()
-            gamma1 = gamma * np.cos(2 * phi)
-            gamma2 = gamma * np.sin(2 * phi)
-            self._gamma = [gamma1, gamma2]
-        if not hasattr(self, "_kappa"):
-            self._kappa = np.random.normal(loc=0, scale=0.05)
-        return self._gamma[0], self._gamma[1], self._kappa
+        if self.los_bool is False:
+            return 0, 0, 0
+        else:
+            z_source = float(self.source.redshift)
+            z_lens = float(self._deflector_dict["z"])
+
+            mixgauss_means = self._mixgauss_means
+            mixgauss_stds = self._mixgauss_stds
+            mixgauss_weights = self._mixgauss_weights
+            if not hasattr(self, "_gamma"):
+                LOS =LineOfSightDistribution()
+                gamma, self._kappa = (
+                    LOS.get_kappa_gamma(
+                        z_source, z_lens,
+                        use_kg_nolos=not self.nonlinear_los_bool))
+                phi = 2 * np.pi * np.random.random()
+                gamma1 = gamma * np.cos(2 * phi)
+                gamma2 = gamma * np.sin(2 * phi)
+                self._gamma = [gamma1, gamma2]
+            return self._gamma[0], self._gamma[1], self._kappa
 
     def deflector_magnitude(self, band):
         """Apparent magnitude of the deflector for a given band.
@@ -384,11 +417,8 @@ class Lens(LensedSystemBase):
                 )
                 return lensed_variable_magnitude
             else:
-                source_mag_unlensed = self.source.point_source_magnitude(band)
-                magnified_mag_list = []
-                for i in range(len(magnif_log)):
-                    magnified_mag_list.append(source_mag_unlensed - magnif_log[i])
-                return np.array(magnified_mag_list)
+                magnified_mag = self.source.point_source_magnitude(band) - magnif_log
+                return magnified_mag
         return self.source.point_source_magnitude(band)
 
     def extended_source_magnitude(self, band, lensed=False):

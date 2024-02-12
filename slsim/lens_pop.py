@@ -5,8 +5,8 @@ from slsim.lens import (
 )
 import numpy as np
 from slsim.lensed_population_base import LensedPopulationBase
-import os
-import pickle
+import multiprocessing
+from functools import partial
 
 
 class LensPop(LensedPopulationBase):
@@ -27,6 +27,9 @@ class LensPop(LensedPopulationBase):
         sky_area=None,
         filters=None,
         cosmo=None,
+        los_bool=True,
+        nonlinear_los_bool=True,
+        return_kext=False,
     ):
         """
 
@@ -53,6 +56,10 @@ class LensPop(LensedPopulationBase):
         :type sky_area: `~astropy.units.Quantity`
         :param filters: filters for SED integration
         :type filters: list of strings or None
+        :param cosmo: cosmology object
+        :type cosmo: `~astropy.cosmology.FLRW`
+        :param los: Boolean to use external convergence/shear.
+        :type los: bool
         """
         super().__init__(sky_area, cosmo)
         if source_type == "galaxies" and kwargs_variability is not None:
@@ -133,10 +140,8 @@ class LensPop(LensedPopulationBase):
                 kwargs_variability_model=kwargs_variability,
             )
             self._source_model_type = "point_source"
-        elif source_type == "quasar_plus_galaxies":
-            from slsim.Sources.point_plus_extended_sources import (
-                PointPlusExtendedSources,
-            )
+        elif source_type in ["quasar_plus_galaxies", "supernovae_plus_galaxies"]:
+            from slsim.Sources.point_plus_extended_source import PointPlusExtendedSource
             from slsim.Sources.QuasarCatalog.quasar_plus_galaxies import (
                 quasar_galaxies_simple,
             )
@@ -144,7 +149,7 @@ class LensPop(LensedPopulationBase):
             if kwargs_quasars_galaxies is None:
                 kwargs_quasars_galaxies = {}
             quasar_galaxy_source = quasar_galaxies_simple(**kwargs_quasars_galaxies)
-            self._sources = PointPlusExtendedSources(
+            self._sources = PointPlusExtendedSource(
                 quasar_galaxy_source,
                 cosmo=cosmo,
                 sky_area=sky_area,
@@ -153,32 +158,13 @@ class LensPop(LensedPopulationBase):
                 kwargs_variability_model=kwargs_variability,
             )
             self._source_model_type = "point_plus_extended"
-        elif source_type == "supernovae_plus_galaxies":
-            from slsim.Sources.point_plus_extended_sources import (
-                PointPlusExtendedSources,
-            )
-
-            # currently, we are using precomputed supernovae catlog. Future plan is to
-            # develop a supernovae class inside the slsim and them here to generate
-            # supernovae light curves.
-            self.path = os.path.dirname(__file__)
-            new_path = self.path + "/Sources/SupernovaeData/supernovae_data.pkl"
-            with open(new_path, "rb") as f:
-                load_supernovae_data = pickle.load(f)
-            self._sources = PointPlusExtendedSources(
-                load_supernovae_data,
-                cosmo=cosmo,
-                sky_area=sky_area,
-                kwargs_cut=kwargs_source_cut,
-                variability_model=variability_model,
-                kwargs_variability_model=kwargs_variability,
-                list_type="list",
-            )
-            self._source_model_type = "point_plus_extended"
         else:
             raise ValueError("source_type %s is not supported" % source_type)
         self.cosmo = cosmo
         self.f_sky = sky_area
+        self.los_bool = los_bool
+        self.nonlinear_los_bool = nonlinear_los_bool
+        self.return_kext = return_kext
 
     def select_lens_at_random(self, **kwargs_lens_cut):
         """Draw a random lens within the cuts of the lens and source, with possible
@@ -197,7 +183,7 @@ class LensPop(LensedPopulationBase):
                 deflector_dict=lens,
                 source_dict=source,
                 variability_model=self._sources.variability_model,
-                kwargs_variability=self._sources.kwargs_variability,
+                kwargs_variab=self._sources.kwargs_variability,
                 cosmo=self.cosmo,
                 source_type=self._source_model_type,
             )
@@ -253,6 +239,7 @@ class LensPop(LensedPopulationBase):
 
         # Initialize an empty list to store the Lens instances
         gg_lens_population = []
+        kappa_ext_origin = []
         # Estimate the number of lensing systems
         num_lenses = self._lens_galaxies.deflector_number()
         # num_sources = self._source_galaxies.galaxies_number()
@@ -277,7 +264,16 @@ class LensPop(LensedPopulationBase):
                         cosmo=self.cosmo,
                         test_area=test_area,
                         source_type=self._source_model_type,
+                        los_bool=self.los_bool,
+                        nonlinear_los_bool=self.nonlinear_los_bool,
                     )
+                    if self.return_kext:
+                        if gg_lens.deflector_redshift >= gg_lens.source_redshift:
+                            pass
+                        elif abs(gg_lens.deflector_redshift - gg_lens.source_redshift) <= 0.1:
+                            pass
+                        else:
+                            kappa_ext_origin.append(gg_lens.external_convergence())
                     # Check the validity of the lens system
                     if gg_lens.validity_test(**kwargs_lens_cuts):
                         gg_lens_population.append(gg_lens)
@@ -288,7 +284,187 @@ class LensPop(LensedPopulationBase):
                         n = num_sources_tested
                     else:
                         n += 1
-        return gg_lens_population
+        if self.return_kext:
+            return gg_lens_population, kappa_ext_origin
+        else:
+            return gg_lens_population
+
+    def compare_quad(self, kwargs_lens_cuts):
+        gg_lens_population = []
+        kappa_ext_origin = []
+        num_lenses = self._lens_galaxies.deflector_number()
+        print('num_lenses',num_lenses)
+        total_number = 0
+        case1 = 0
+        case1_quad = 0
+        case1_double = 0
+        case2 = 0
+        case2_quad = 0
+        case2_double = 0
+        case3 = 0
+        case3_quad = 0
+        case3_double = 0
+        for _ in range(num_lenses):
+            lens = self._lens_galaxies.draw_deflector()
+            test_area = draw_test_area(deflector=lens)
+            num_sources_tested = 50
+            # TODO: to implement this for a multi-source plane lens system
+            if num_sources_tested > 0:
+                n = 0
+                while n < num_sources_tested:
+                    source = self._sources.draw_source()
+                    gg_lens_without_los = Lens(
+                        deflector_dict=lens,
+                        source_dict=source,
+                        cosmo=self.cosmo,
+                        test_area=test_area,
+                        source_type=self._source_model_type,
+                        los_bool=False,
+                        nonlinear_los_bool=False,
+                    )
+                    gg_lens_with_los_without_nlc = Lens(
+                        deflector_dict=lens,
+                        source_dict=source,
+                        cosmo=self.cosmo,
+                        test_area=test_area,
+                        source_type=self._source_model_type,
+                        los_bool=True,
+                        nonlinear_los_bool=False,
+                    )
+                    gg_lens_with_los_with_nlc = Lens(
+                        deflector_dict=lens,
+                        source_dict=source,
+                        cosmo=self.cosmo,
+                        test_area=test_area,
+                        source_type=self._source_model_type,
+                        los_bool=True,
+                        nonlinear_los_bool=True,
+                    )
+                    if self.return_kext:
+                        if gg_lens_without_los.deflector_redshift >= gg_lens_without_los.source_redshift:
+                            pass
+                        elif abs(gg_lens_without_los.deflector_redshift - gg_lens_without_los.source_redshift) <= 0.1:
+                            # TODO: !!!!
+                            pass
+                        else:
+                            total_number = total_number + 1
+                            # todo: cut here
+                    # Check the validity of the lens system
+                    if gg_lens_without_los.validity_test(**kwargs_lens_cuts):
+                        if gg_lens_without_los.image_number == 4:
+                            case1_quad = case1_quad + 1
+                        if gg_lens_without_los.image_number == 2:
+                            case1_double = case1_double + 1
+                        case1 = case1 + 1
+                    if gg_lens_with_los_without_nlc.validity_test(**kwargs_lens_cuts):
+                        if gg_lens_with_los_without_nlc.image_number == 4:
+                            case2_quad = case2_quad + 1
+                        if gg_lens_with_los_without_nlc.image_number == 2:
+                            case2_double = case2_double + 1
+                        case2 = case2 + 1
+                    if gg_lens_with_los_with_nlc.validity_test(**kwargs_lens_cuts):
+                        if gg_lens_with_los_with_nlc.image_number == 4:
+                            case3_quad = case3_quad + 1
+                        if gg_lens_with_los_with_nlc.image_number == 2:
+                            case3_double = case3_double + 1
+                        case3 = case3 + 1
+                    n += 1
+        return case1, case1_quad, case1_double, case2, case2_quad, case2_double, case3, case3_quad, case3_double, total_number
+
+    def compare_quad_muiltprocess(self, kwargs_lens_cuts):
+            num_lenses = self._lens_galaxies.deflector_number()
+            print('num_lenses', num_lenses)
+
+            # Create a pool of workers
+            pool = multiprocessing.Pool()
+
+            # Partial function application to set common parameters
+            process_func = partial(
+                process_lens,
+                sources=self._sources,
+                cosmo=self.cosmo,
+                sky_area=self.f_sky,
+                source_model_type=self._source_model_type,
+                return_kext=self.return_kext,
+                kwargs_lens_cuts=kwargs_lens_cuts
+            )
+
+            # Get a list of all lenses to process
+            all_lenses = [self._lens_galaxies.draw_deflector() for _ in range(num_lenses)]
+
+            # Use pool.map to apply the function to each lens
+            results = pool.map(process_func, all_lenses)
+
+            # Close the pool and wait for tasks to complete
+            pool.close()
+            pool.join()
+
+            # Aggregate results
+            aggregated_results = [sum(x) for x in zip(*results)]
+            return aggregated_results
+
+def process_lens(lens, sources, cosmo, sky_area, source_model_type, return_kext, kwargs_lens_cuts):
+    test_area = draw_test_area(deflector=lens)
+    num_sources_tested = 50
+    case1, case1_quad, case1_double = 0, 0, 0
+    case2, case2_quad, case2_double = 0, 0, 0
+    case3, case3_quad, case3_double = 0, 0, 0
+    total_number = 0
+
+    for _ in range(num_sources_tested):
+        source = sources.draw_source()
+
+        # Create lens systems with different configurations
+        gg_lens_without_los = Lens(
+            deflector_dict=lens,
+            source_dict=source,
+            cosmo=cosmo,
+            test_area=test_area,
+            source_type=source_model_type,
+            los_bool=False,
+            nonlinear_los_bool=False,
+        )
+        gg_lens_with_los_without_nlc = Lens(
+            deflector_dict=lens,
+            source_dict=source,
+            cosmo=cosmo,
+            test_area=test_area,
+            source_type=source_model_type,
+            los_bool=True,
+            nonlinear_los_bool=False,
+        )
+        gg_lens_with_los_with_nlc = Lens(
+            deflector_dict=lens,
+            source_dict=source,
+            cosmo=cosmo,
+            test_area=test_area,
+            source_type=source_model_type,
+            los_bool=True,
+            nonlinear_los_bool=True,
+        )
+        # Check the validity of the lens system and count the occurrences
+        if gg_lens_without_los.validity_test(**kwargs_lens_cuts):
+            case1 += 1
+            if gg_lens_without_los.image_number == 4:
+                case1_quad += 1
+            elif gg_lens_without_los.image_number == 2:
+                case1_double += 1
+
+        if gg_lens_with_los_without_nlc.validity_test(**kwargs_lens_cuts):
+            case2 += 1
+            if gg_lens_with_los_without_nlc.image_number == 4:
+                case2_quad += 1
+            elif gg_lens_with_los_without_nlc.image_number == 2:
+                case2_double += 1
+
+        if gg_lens_with_los_with_nlc.validity_test(**kwargs_lens_cuts):
+            case3 += 1
+            if gg_lens_with_los_with_nlc.image_number == 4:
+                case3_quad += 1
+            elif gg_lens_with_los_with_nlc.image_number == 2:
+                case3_double += 1
+
+    return case1, case1_quad, case1_double, case2, case2_quad, case2_double, case3, case3_quad, case3_double, total_number
 
 
 def draw_test_area(deflector):
@@ -300,3 +476,4 @@ def draw_test_area(deflector):
     theta_e_infinity = theta_e_when_source_infinity(deflector)
     test_area = np.pi * (theta_e_infinity * 2.5) ** 2
     return test_area
+

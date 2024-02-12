@@ -158,7 +158,7 @@ def pes_lens_instance():
             deflector_dict=deflector_dict,
             source_type="point_plus_extended",
             variability_model="sinusoidal",
-            kwargs_variability={"amp", "freq"},
+            kwargs_variab={"amp", "freq"},
             cosmo=cosmo,
         )
         if pes_lens.validity_test():
